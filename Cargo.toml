@@ -1,0 +1,25 @@
+[package]
+name = "tcnet-rust"
+version = "0.1.0"
+edition = "2021"
+description = "A Rust implementation of the TCNet protocol for real-time timecode sharing"
+license = "MIT"
+
+[lib]
+name = "tcnet"
+path = "src/lib.rs"
+
+[[bin]]
+name = "tcnet-listener"
+path = "src/bin/tcnet_listener.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["net", "rt-multi-thread", "macros", "sync", "time"] }
+thiserror = "1"
+bytes = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "4", features = ["derive"] }
+mac_address = "1"
+socket2 = { version = "0.5", features = ["all"] }
+binrw = "0.14"
