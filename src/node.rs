@@ -3,7 +3,7 @@
 //! A node represents this application's presence on the TCNet network.
 
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
-use std::sync::atomic::{AtomicU8, AtomicU16, Ordering};
+use std::sync::atomic::{AtomicU16, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -14,8 +14,8 @@ use tracing::{debug, error, info, trace};
 
 use crate::error::Result;
 use crate::packets::{
-    MixerDataPacket, OptInBuilder, OptInPacket, Packet, RequestDataType, RequestPacket,
-    StatusPacket, TimePacket,
+    AppDataPacket, MetadataPacket, MetricsDataPacket, MixerDataPacket, OptInBuilder, OptInPacket,
+    Packet, RequestDataType, RequestPacket, StatusPacket, TimePacket,
 };
 use crate::registry::{NodeKey, NodeRegistry, RegistryEvent, RemovalReason};
 use crate::types::{
@@ -44,7 +44,7 @@ pub struct NodeConfig {
 impl Default for NodeConfig {
     fn default() -> Self {
         Self {
-            node_name: "SYNM".to_string(),
+            node_name: "Arena".to_string(),
             node_type: NodeType::Slave,
             node_options: NodeOptions::new(),
             listener_port: PORT_UNICAST_DEFAULT,
@@ -87,6 +87,10 @@ pub enum NodeEvent {
     TimePacket(TimePacket),
     /// Received a status packet
     StatusPacket(StatusPacket),
+    /// Received a metrics data packet
+    MetricsDataPacket(MetricsDataPacket),
+    /// Received a metadata packet
+    MetadataPacket(MetadataPacket),
     /// Received a mixer data packet
     MixerDataPacket(MixerDataPacket),
     /// A new node was discovered on the network
@@ -121,6 +125,8 @@ pub struct Node {
     start_time: Instant,
     event_tx: broadcast::Sender<NodeEvent>,
     registry: Mutex<NodeRegistry>,
+    /// Socket for sending unicast subscription packets (set during run())
+    unicast_socket: Mutex<Option<Arc<UdpSocket>>>,
 }
 
 impl Node {
@@ -130,7 +136,8 @@ impl Node {
         let node_id = (std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
-            .as_micros() & 0xFFFF) as u16;
+            .as_micros()
+            & 0xFFFF) as u16;
 
         let (event_tx, _) = broadcast::channel(256);
 
@@ -142,6 +149,7 @@ impl Node {
             start_time: Instant::now(),
             event_tx,
             registry: Mutex::new(NodeRegistry::new()),
+            unicast_socket: Mutex::new(None),
         }
     }
 
@@ -206,28 +214,97 @@ impl Node {
         )
     }
 
+    /// Build Resolume-style application data packets for subscription.
+    /// Returns a pair of packets that should both be sent.
+    fn build_app_data_pair(&self) -> Vec<AppDataPacket> {
+        AppDataPacket::resolume_style_pair(
+            self.node_id,
+            &self.config.node_name,
+            self.next_sequence(),
+            self.config.node_type,
+            self.config.node_options,
+            self.timestamp_us(),
+        )
+    }
+
+    /// Send subscription packets to a node to start receiving mixer data.
+    /// This mimics what Resolume does: sends app data + request packets for types 2 and 4.
+    async fn send_subscriptions(&self, target_addr: SocketAddr) {
+        let socket_guard = self.unicast_socket.lock().await;
+        let Some(socket) = socket_guard.as_ref() else {
+            debug!("Cannot send subscriptions: unicast socket not initialized");
+            return;
+        };
+
+        info!("Sending subscriptions to {}", target_addr);
+
+        // Send Resolume-style app data packets (subscription) - both packets are needed
+        // let app_data_packets = self.build_app_data_pair();
+        // for (i, packet) in app_data_packets.iter().enumerate() {
+        //     if let Err(e) = socket.send_to(&packet.to_bytes(), target_addr).await {
+        //         debug!("Failed to send app data packet {} to {}: {}", i + 1, target_addr, e);
+        //     } else {
+        //         trace!("Sent app data packet {} to {}", i + 1, target_addr);
+        //     }
+        // }
+
+        // // Send request for layer status (type 2)
+        let request_status = self.build_request(RequestDataType::LayerStatus, 1);
+        if let Err(e) = socket.send_to(&request_status.to_bytes(), target_addr).await {
+            debug!("Failed to send layer status request to {}: {}", target_addr, e);
+        }
+
+        // // Send request for metadata (type 4)
+        for layer in 1..8 {
+            let request_metadata = self.build_request(RequestDataType::Metadata, layer);
+            if let Err(e) = socket
+                .send_to(&request_metadata.to_bytes(), target_addr)
+                .await
+            {
+                debug!("Failed to send metadata request to {}: {}", target_addr, e);
+            }
+        }
+
+        // let app_data_packets = self.build_app_data_pair();
+        // for (i, packet) in app_data_packets.iter().enumerate() {
+        //     if let Err(e) = socket.send_to(&packet.to_bytes(), target_addr).await {
+        //         debug!("Failed to send app data packet {} to {}: {}", i + 1, target_addr, e);
+        //     } else {
+        //         trace!("Sent app data packet {} to {}", i + 1, target_addr);
+        //     }
+        // }
+
+        // // // Also send explicit mixer data request
+        // let request_mixer = self.build_request(RequestDataType::MixerData, 0);
+        // if let Err(e) = socket.send_to(&request_mixer.to_bytes(), target_addr).await {
+        //     debug!("Failed to send mixer data request to {}: {}", target_addr, e);
+        // }
+
+        debug!("Sent all subscription packets to {}", target_addr);
+    }
+
     /// Create a UDP socket with SO_REUSEADDR and SO_REUSEPORT for sharing ports with other apps.
     /// This allows multiple applications (like Pro DJ Link Bridge) to receive broadcasts on the same port.
     fn create_reusable_socket(port: u16) -> std::io::Result<UdpSocket> {
         let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
-        
+
         // Allow address reuse - required for multiple processes to bind to same port
         socket.set_reuse_address(true)?;
-        
+
         // Enable SO_REUSEPORT - allows multiple sockets to receive the same broadcast packets
         // This is key for coexisting with other TCNet apps like Pro DJ Link Bridge
         socket.set_reuse_port(true)?;
-        
+
         // Enable broadcast receiving
         socket.set_broadcast(true)?;
-        
+
         // Set non-blocking for tokio compatibility
         socket.set_nonblocking(true)?;
-        
+
         // Bind to the port
         let addr = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port);
         socket.bind(&addr.into())?;
-        
+
         // Convert socket2::Socket -> std::net::UdpSocket -> tokio::net::UdpSocket
         let std_socket: std::net::UdpSocket = socket.into();
         UdpSocket::from_std(std_socket)
@@ -253,7 +330,9 @@ impl Node {
                 });
             }
             RegistryEvent::NodeRemoved { node_name, reason } => {
-                let _ = self.event_tx.send(NodeEvent::NodeLeft { node_name, reason });
+                let _ = self
+                    .event_tx
+                    .send(NodeEvent::NodeLeft { node_name, reason });
             }
         }
     }
@@ -262,19 +341,37 @@ impl Node {
     pub async fn run(self: Arc<Self>) -> Result<()> {
         // Bind to broadcast ports with SO_REUSEADDR/SO_REUSEPORT
         // This allows coexistence with other TCNet apps (e.g., Pro DJ Link Bridge)
-        info!("Binding to control broadcast port {} (with port reuse)", PORT_BROADCAST_CONTROL);
+        info!(
+            "Binding to control broadcast port {} (with port reuse)",
+            PORT_BROADCAST_CONTROL
+        );
         let control_socket: UdpSocket = Self::create_reusable_socket(PORT_BROADCAST_CONTROL)?;
 
-        info!("Binding to time broadcast port {} (with port reuse)", PORT_BROADCAST_TIME);
+        info!(
+            "Binding to time broadcast port {} (with port reuse)",
+            PORT_BROADCAST_TIME
+        );
         let time_socket: UdpSocket = Self::create_reusable_socket(PORT_BROADCAST_TIME)?;
 
         // Bind to our unicast listener port for receiving responses to requests
-        info!("Binding to unicast listener port {}", self.config.listener_port);
+        info!(
+            "Binding to unicast listener port {}",
+            self.config.listener_port
+        );
         let unicast_socket: UdpSocket = Self::create_reusable_socket(self.config.listener_port)?;
+        let unicast_socket: Arc<UdpSocket> = Arc::new(unicast_socket);
+
+        // Store unicast socket for sending subscriptions
+        {
+            let mut socket_guard = self.unicast_socket.lock().await;
+            *socket_guard = Some(Arc::clone(&unicast_socket));
+        }
 
         // Socket for sending Opt-IN broadcasts (ephemeral port, no reuse needed)
-        let send_socket: UdpSocket = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)).await?;
+        let send_socket: UdpSocket =
+            UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)).await?;
         send_socket.set_broadcast(true)?;
+        let send_socket = Arc::new(send_socket);
 
         let broadcast_addr = SocketAddr::V4(SocketAddrV4::new(
             Ipv4Addr::BROADCAST,
@@ -283,21 +380,23 @@ impl Node {
 
         info!(
             "TCNet node '{}' starting on ports {} (control), {} (time), {} (unicast)",
-            self.config.node_name, PORT_BROADCAST_CONTROL, PORT_BROADCAST_TIME, self.config.listener_port
+            self.config.node_name,
+            PORT_BROADCAST_CONTROL,
+            PORT_BROADCAST_TIME,
+            self.config.listener_port
         );
 
         // Spawn Opt-IN sender task
         let node_clone = Arc::clone(&self);
-        let send_socket: Arc<UdpSocket> = Arc::new(send_socket);
-        let send_socket_clone: Arc<UdpSocket> = Arc::clone(&send_socket);
-        
+        let send_socket_clone = Arc::clone(&send_socket);
+
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_millis(500));
             loop {
                 interval.tick().await;
                 let packet = node_clone.build_opt_in();
                 let bytes = packet.to_bytes();
-                
+
                 if let Err(e) = send_socket_clone.send_to(&bytes, broadcast_addr).await {
                     error!("Failed to send Opt-IN: {}", e);
                 } else {
@@ -316,47 +415,13 @@ impl Node {
                     let mut registry = node_clone.registry.lock().await;
                     let events = registry.cleanup_stale_nodes();
                     // Update our node count
-                    node_clone.node_count.store(registry.len() as u16, Ordering::Relaxed);
+                    node_clone
+                        .node_count
+                        .store(registry.len() as u16, Ordering::Relaxed);
                     events
                 };
                 for event in events {
                     node_clone.emit_registry_event(event);
-                }
-            }
-        });
-
-        // Spawn mixer data request task - requests mixer data from master/repeater nodes every second
-        let node_clone = Arc::clone(&self);
-        let send_socket_clone = Arc::clone(&send_socket);
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(1));
-            loop {
-                interval.tick().await;
-
-                // Get list of master/repeater nodes with their listener ports
-                let targets: Vec<(std::net::IpAddr, u16)> = {
-                    let registry = node_clone.registry.lock().await;
-                    registry
-                        .nodes()
-                        .filter(|n| {
-                            n.node_type == NodeType::Master || n.node_type == NodeType::Repeater
-                        })
-                        .map(|n| (n.address.ip(), n.listener_port))
-                        .collect()
-                };
-
-                // Send mixer data request to each target
-                for (ip, port) in targets {
-                    debug!("Sending mixer data request to {} ({})", ip, port);
-                    let request = node_clone.build_request(RequestDataType::MixerData, 0);
-                    let bytes = request.to_bytes();
-                    let target_addr = SocketAddr::new(ip, port);
-
-                    if let Err(e) = send_socket_clone.send_to(&bytes, target_addr).await {
-                        debug!("Failed to send mixer data request to {}: {}", target_addr, e);
-                    } else {
-                        trace!("Sent mixer data request to {}", target_addr);
-                    }
                 }
             }
         });
@@ -385,10 +450,11 @@ impl Node {
 
         // Spawn unicast listener for responses to request packets
         let node_clone = Arc::clone(&self);
+        let unicast_socket_clone = Arc::clone(&unicast_socket);
         tokio::spawn(async move {
             let mut buf = [0u8; 4096]; // Larger buffer for data packets like waveforms
             loop {
-                match unicast_socket.recv_from(&mut buf).await {
+                match unicast_socket_clone.recv_from(&mut buf).await {
                     Ok((len, addr)) => {
                         if len >= 8 {
                             trace!("Unicast packet from {}: len={}, type={}", addr, len, buf[7]);
@@ -429,11 +495,16 @@ impl Node {
         match packet {
             Packet::Time(time_packet) => {
                 trace!(
-                    "Received time packet from {} ({}) {:#?}",
+                    "Received time packet from {} ({})",
                     time_packet.header.node_name_str(),
-                    addr,
-                    time_packet
+                    addr
                 );
+                // trace!(
+                //     "Received time packet from {} ({}) {:#?}",
+                //     time_packet.header.node_name_str(),
+                //     addr,
+                //     time_packet
+                // );
                 let _ = self.event_tx.send(NodeEvent::TimePacket(time_packet));
             }
             Packet::Status(status_packet) => {
@@ -444,7 +515,8 @@ impl Node {
                     addr,
                     status_packet
                 );
-                
+                // trace!("Received status packet from {} (addr: {})", node_name, addr);
+
                 // Also refresh the node in registry if we know about it
                 // (Status packets prove the node is still alive)
                 let key = NodeKey::new(addr, node_name);
@@ -452,12 +524,14 @@ impl Node {
                     let mut registry = self.registry.lock().await;
                     registry.refresh_node(&key);
                 }
-                
+
                 let _ = self.event_tx.send(NodeEvent::StatusPacket(status_packet));
             }
             Packet::OptIn(opt_in) => {
                 let node_name = opt_in.header.node_name_str();
                 let key = NodeKey::new(addr, node_name.clone());
+                let node_type = opt_in.header.node_type;
+                let listener_port = opt_in.listener_port;
                 trace!(
                     "Received Opt-IN from {} (key: {:?}, addr: {}) - {} {}",
                     node_name,
@@ -473,29 +547,33 @@ impl Node {
                     registry.update_node(
                         key,
                         node_name,
-                        opt_in.header.node_type,
+                        node_type,
                         opt_in.header.node_id,
                         opt_in.vendor_name_str(),
                         opt_in.app_name_str(),
                         opt_in.app_version_str(),
-                        opt_in.listener_port,
+                        listener_port,
                         addr,
                         opt_in.node_count,
                         opt_in.uptime_secs,
                     )
                 };
 
-                if let Some(event) = event {
-                    self.emit_registry_event(event);
+                if let Some(ref event) = event {
+                    self.emit_registry_event(event.clone());
+
+                    // If a new Master/Repeater was discovered, send subscription packets
+                    if matches!(event, RegistryEvent::NodeDiscovered(_))
+                        && (node_type == NodeType::Master || node_type == NodeType::Repeater)
+                    {
+                        let target_addr = SocketAddr::new(addr.ip(), listener_port);
+                        self.send_subscriptions(target_addr).await;
+                    }
                 }
             }
             Packet::OptOut(header) => {
                 let node_name = header.node_name_str();
-                info!(
-                    "Received Opt-OUT from {} ({})",
-                    node_name,
-                    addr
-                );
+                info!("Received Opt-OUT from {} ({})", node_name, addr);
 
                 // Remove from registry
                 let key = NodeKey::new(addr, node_name);
@@ -508,12 +586,34 @@ impl Node {
                     self.emit_registry_event(event);
                 }
             }
+            Packet::MetricsData(metrics_packet) => {
+                trace!(
+                    "Received metrics data from {} (layer: {}, bpm: {:.2})",
+                    metrics_packet.header.node_name_str(),
+                    metrics_packet.layer,
+                    metrics_packet.bpm(),
+                );
+                let _ = self
+                    .event_tx
+                    .send(NodeEvent::MetricsDataPacket(metrics_packet));
+            }
+            Packet::Metadata(metadata_packet) => {
+                debug!(
+                    "Received metadata from {} (layer: {}, track: {}) {:#?}",
+                    metadata_packet.header.node_name_str(),
+                    metadata_packet.layer,
+                    metadata_packet.display_string(),
+                    metadata_packet
+                );
+                let _ = self
+                    .event_tx
+                    .send(NodeEvent::MetadataPacket(metadata_packet));
+            }
             Packet::MixerData(mixer_packet) => {
                 debug!(
-                    "Received mixer data from {} (mixer: {}) {:#?}",
+                    "Received mixer data from {} (mixer: {})",
                     mixer_packet.header.node_name_str(),
                     mixer_packet.mixer_name,
-                    mixer_packet
                 );
                 let _ = self.event_tx.send(NodeEvent::MixerDataPacket(mixer_packet));
             }

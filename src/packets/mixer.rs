@@ -236,12 +236,11 @@ impl MixerDataPacket {
         }
 
         // Debug: dump key byte ranges
-        info!(
-            "Mixer packet raw bytes len: {}:\n\
-             {:02x?}",
-             data.len(),
-            &data
-        );
+        // info!(
+        //     "Mixer packet raw bytes:\n\
+        //      {:02x?}",
+        //     &data
+        // );
 
         let mut cursor = Cursor::new(data);
         let raw = RawMixerDataPacket::read(&mut cursor)

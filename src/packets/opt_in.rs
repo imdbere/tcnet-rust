@@ -193,12 +193,12 @@ impl OptInBuilder {
             node_type: NodeType::Slave,
             node_options: NodeOptions::new(),
             listener_port: PORT_UNICAST_DEFAULT,
-            vendor_name: "tcnet-rust".to_string(),
-            app_name: "TCNet Listener".to_string(),
+            vendor_name: "Resolume".to_string(),
+            app_name: "Arena".to_string(),
             app_version: (
-                PROTOCOL_VERSION_MAJOR,
-                PROTOCOL_VERSION_MINOR,
-                0,
+                7,
+                23,
+                2,
             ),
         }
     }

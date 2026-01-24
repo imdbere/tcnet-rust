@@ -16,7 +16,7 @@ use tracing_subscriber::EnvFilter;
 #[command(author, version, about, long_about = None)]
 struct Args {
     /// Node name (max 8 characters)
-    #[arg(short, long, default_value = "SYNM")]
+    #[arg(short, long, default_value = "Arena")]
     name: String,
 
     /// Show all layers, not just active ones
@@ -160,8 +160,8 @@ async fn main() -> tcnet::Result<()> {
     // Create node config
     let config = NodeConfig::new(&args.name)
         .with_type(NodeType::Slave)
-        .with_vendor("tcnet-rust")
-        .with_app("tcnet-listener", (0, 1, 0));
+        .with_vendor("Resolume")
+        .with_app("Arena", (7, 23, 2));
 
     info!("Starting TCNet listener as node '{}'", args.name);
     info!("Listening for time packets on UDP port 60001");
@@ -200,6 +200,29 @@ async fn main() -> tcnet::Result<()> {
                             status.header.node_name_str(),
                             status.smpte_mode,
                             status.auto_master_mode_str()
+                        );
+                    }
+                }
+                NodeEvent::MetricsDataPacket(metrics) => {
+                    if show_nodes {
+                        info!(
+                            "Metrics from {} [{}]: {} @ {:.2} BPM, pos={}, beat={}",
+                            metrics.header.node_name_str(),
+                            metrics.layer,
+                            metrics.layer_state,
+                            metrics.bpm(),
+                            metrics.position_string(),
+                            metrics.beat_number,
+                        );
+                    }
+                }
+                NodeEvent::MetadataPacket(metadata) => {
+                    if show_nodes {
+                        info!(
+                            "Metadata from {} [{}]: {}",
+                            metadata.header.node_name_str(),
+                            metadata.layer,
+                            metadata.display_string(),
                         );
                     }
                 }

@@ -208,6 +208,89 @@ pub struct RawOnAirData {
 }
 
 // ============================================================================
+// Metrics Data Packet (122 bytes) - Data Type 2
+// ============================================================================
+
+/// Raw Metrics Data packet as it appears on the wire (122 bytes).
+/// This is a TCNet Data Packet (type 200) with DataType 2.
+#[binread]
+#[br(little)]
+#[derive(Debug, Clone)]
+pub struct RawMetricsDataPacket {
+    /// Management header (bytes 0-23)
+    pub header: RawManagementHeader,
+    /// Data type (byte 24) - should be 2 for Metrics Data
+    pub data_type: u8,
+    /// Layer ID (byte 25) - 1-8
+    pub layer_id: u8,
+    /// Reserved (byte 26)
+    pub _reserved1: u8,
+    /// Layer state (byte 27)
+    pub layer_state: u8,
+    /// Reserved (byte 28)
+    pub _reserved2: u8,
+    /// Sync master (byte 29) - 0=Slave, 1=Master
+    pub sync_master: u8,
+    /// Reserved (byte 30)
+    pub _reserved3: u8,
+    /// Beat marker (byte 31) - 1-4
+    pub beat_marker: u8,
+    /// Track length in milliseconds (bytes 32-35)
+    pub track_length_ms: u32,
+    /// Current position in milliseconds (bytes 36-39)
+    pub current_position_ms: u32,
+    /// Speed (bytes 40-43) - 0-65536 where 32768=100%
+    pub speed: u32,
+    /// Reserved (bytes 44-56) - 13 bytes
+    #[br(count = 13)]
+    pub _reserved4: Vec<u8>,
+    /// Beat number (bytes 57-60)
+    pub beat_number: u32,
+    /// Reserved (bytes 61-111) - 51 bytes
+    #[br(count = 51)]
+    pub _reserved5: Vec<u8>,
+    /// BPM (bytes 112-115) - scaled value (0.01-999.99 * 100)
+    pub bpm: u32,
+    /// Pitch bend (bytes 116-117) - 0-65536 where 32768=100%
+    pub pitch_bend: u16,
+    /// Track ID (bytes 118-121)
+    pub track_id: u32,
+}
+
+// ============================================================================
+// Metadata Packet (548 bytes) - Data Type 4
+// ============================================================================
+
+/// Raw Metadata packet as it appears on the wire (548 bytes).
+/// This is a TCNet Data Packet (type 200) with DataType 4.
+#[binread]
+#[br(little)]
+#[derive(Debug, Clone)]
+pub struct RawMetadataPacket {
+    /// Management header (bytes 0-23)
+    pub header: RawManagementHeader,
+    /// Data type (byte 24) - should be 4 for Metadata
+    pub data_type: u8,
+    /// Layer ID (byte 25) - 1-8
+    pub layer_id: u8,
+    /// Reserved (byte 26)
+    pub _reserved1: u8,
+    /// Reserved (bytes 27-28)
+    #[br(count = 2)]
+    pub _reserved2: Vec<u8>,
+    /// Track artist (bytes 29-284) - 256 bytes UTF-8/UTF-16
+    pub track_artist: FixedStr<256>,
+    /// Track title (bytes 285-540) - 256 bytes UTF-8/UTF-16
+    pub track_title: FixedStr<256>,
+    /// Track key (bytes 541-542)
+    pub track_key: u16,
+    /// Track ID (bytes 543-546)
+    pub track_id: u32,
+    /// Reserved (byte 547) - padding to 548 bytes
+    pub _reserved3: u8,
+}
+
+// ============================================================================
 // Mixer Data Packet (270 bytes) - Data Type 150
 // ============================================================================
 

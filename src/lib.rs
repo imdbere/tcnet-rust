@@ -62,8 +62,8 @@ pub use error::{Result, TcNetError};
 pub use header::ManagementHeader;
 pub use node::{Node, NodeConfig, NodeEvent};
 pub use packets::{
-    LayerStatus, LayerTimeData, MixerChannel, MixerDataPacket, MixerType, OptInPacket, Packet,
-    StatusPacket, TimePacket,
+    LayerStatus, LayerTimeData, MetadataPacket, MetricsDataPacket, MixerChannel, MixerDataPacket,
+    MixerType, OptInPacket, Packet, StatusPacket, TimePacket, TrackKey,
 };
 pub use registry::{NodeInfo, NodeRegistry, RegistryEvent, RemovalReason};
 pub use types::{

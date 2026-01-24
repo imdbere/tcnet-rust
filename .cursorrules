@@ -1,0 +1,102 @@
+# TCNet Rust Implementation
+
+## Overview
+
+This is a Rust implementation of the **TCNet protocol** (v3.5.1B), an open UDP-based protocol for sharing real-time timecode and metadata between entertainment industry devices (DJ software, lighting controllers, VJ software, etc.).
+
+The crate is both a **library** (`tcnet`) and a **CLI tool** (`tcnet-listener`).
+
+## Architecture
+
+```
+src/
+├── lib.rs          # Library root, re-exports public API
+├── types.rs        # Core enums/structs: NodeType, MessageType, Layer, Timecode, etc.
+├── error.rs        # Error types using thiserror
+├── header.rs       # 24-byte ManagementHeader (common to all packets)
+├── wire.rs         # binrw-derived structs for binary packet layout
+├── node.rs         # TcNetNode: main runtime, socket handling, Opt-IN/OUT
+├── registry.rs     # NodeRegistry: tracks active nodes with timeout logic
+├── packets/
+│   ├── mod.rs      # Packet enum, dispatches parsing by MessageType
+│   ├── opt_in.rs   # Opt-IN packet (node announcement)
+│   ├── status.rs   # Status packet (node state)
+│   ├── time.rs     # Time packet (layer timecodes)
+│   ├── mixer.rs    # Mixer data packet (DJ mixer state)
+│   ├── request.rs  # Request packet (subscribe to data)
+│   └── app_data.rs # Application-specific data packets
+└── bin/
+    └── tcnet_listener.rs  # CLI tool entry point
+```
+
+## Key Concepts
+
+### Packet Parsing with binrw
+
+All binary packet structures are defined in `wire.rs` using the `binrw` crate. The `Raw*` structs represent exact wire format, then get converted to high-level types.
+
+```rust
+// wire.rs - raw binary layout
+#[derive(BinRead, Debug)]
+#[br(little)]
+pub struct RawTimePacket {
+    pub l1_timecode: RawLayerTimecode,
+    // ...
+}
+
+// packets/time.rs - high-level API
+impl TimePacket {
+    pub fn parse(header: ManagementHeader, data: &[u8]) -> Result<Self> {
+        let raw: RawTimePacket = Cursor::new(data).read_le()?;
+        // Convert raw to TimePacket...
+    }
+}
+```
+
+### Node Lifecycle
+
+1. `Node::new(config)` - Create node with name/type
+2. `node.subscribe()` - Get broadcast receiver for `NodeEvent`s
+3. `node.run().await` - Starts listeners, sends Opt-IN, processes packets
+
+### Network Ports
+
+- **60000**: Broadcast (Opt-IN/OUT, Time packets)
+- **60001**: Unicast (Status, Mixer data, Request responses)
+
+Sockets use `SO_REUSEADDR` + `SO_REUSEPORT` to coexist with other TCNet apps.
+
+### Node Registry
+
+Tracks discovered nodes by `(IP, node_name)` key. Nodes timeout after 10s without Opt-IN. Emits `RegistryEvent::NodeDiscovered`, `NodeUpdated`, `NodeRemoved`.
+
+## Common Tasks
+
+### Adding a New Packet Type
+
+1. Add raw struct to `wire.rs` with `#[derive(BinRead)]`
+2. Create `packets/new_type.rs` with high-level struct and `parse()` method
+3. Add variant to `Packet` enum in `packets/mod.rs`
+4. Handle in `Packet::parse()` dispatch
+5. Add `NodeEvent` variant if needed
+6. Re-export from `lib.rs`
+
+### Reference Documentation
+
+The TCNet specification is in `references/TCNet-docs-OCR.md` (OCR'd from the official PDF).
+
+## Dependencies
+
+- **tokio**: Async runtime (UDP sockets, channels, timers)
+- **binrw**: Declarative binary parsing
+- **socket2**: Socket options (SO_REUSEPORT)
+- **tracing**: Structured logging
+- **clap**: CLI argument parsing
+- **thiserror**: Error derive macro
+
+## Conventions
+
+- Use `tracing::debug!` / `trace!` for packet-level logging
+- Prefer `binrw` for new packet parsing (not manual offset math)
+- High-level packet structs live in `packets/`, raw wire structs in `wire.rs`
+- Node names are 8-char max, padded with nulls

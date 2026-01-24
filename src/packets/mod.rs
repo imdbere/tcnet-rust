@@ -2,12 +2,18 @@
 //!
 //! This module contains parsers and builders for various TCNet packet types.
 
+mod app_data;
+mod metadata;
+mod metrics;
 mod mixer;
 mod opt_in;
 mod request;
 mod status;
 mod time;
 
+pub use app_data::AppDataPacket;
+pub use metadata::{MetadataPacket, TrackKey, METADATA_DATA_TYPE, METADATA_PACKET_SIZE};
+pub use metrics::{MetricsDataPacket, METRICS_DATA_TYPE, METRICS_DATA_PACKET_SIZE};
 pub use mixer::{
     MixerChannel, MixerCrossfader, MixerDataPacket, MixerEffects, MixerFilter, MixerMaster,
     MixerMonitor, MixerType, MIXER_DATA_TYPE,
@@ -32,6 +38,10 @@ pub enum Packet {
     Status(StatusPacket),
     /// Time packet with layer timing data
     Time(TimePacket),
+    /// Metrics data packet with playback info
+    MetricsData(MetricsDataPacket),
+    /// Metadata packet with track info
+    Metadata(MetadataPacket),
     /// Mixer data packet with mixer state
     MixerData(MixerDataPacket),
     /// Unknown or unsupported packet type (header only)
@@ -70,6 +80,8 @@ impl Packet {
         let data_type = data[24];
 
         match data_type {
+            METRICS_DATA_TYPE => Ok(Packet::MetricsData(MetricsDataPacket::parse(data)?)),
+            METADATA_DATA_TYPE => Ok(Packet::Metadata(MetadataPacket::parse(data)?)),
             MIXER_DATA_TYPE => Ok(Packet::MixerData(MixerDataPacket::parse(data)?)),
             _ => Ok(Packet::Unknown(header)),
         }
@@ -82,6 +94,8 @@ impl Packet {
             Packet::OptOut(h) => h,
             Packet::Status(p) => &p.header,
             Packet::Time(p) => &p.header,
+            Packet::MetricsData(p) => &p.header,
+            Packet::Metadata(p) => &p.header,
             Packet::MixerData(p) => &p.header,
             Packet::Unknown(h) => h,
         }
