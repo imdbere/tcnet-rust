@@ -15,8 +15,8 @@ use tracing::{debug, error, info, trace};
 use crate::auth::AuthManager;
 use crate::error::Result;
 use crate::packets::{
-    AppDataPacket, ErrorNotificationPacket, MetadataPacket, MetricsDataPacket, MixerDataPacket,
-    OptInBuilder, OptInPacket, Packet, RequestDataType, RequestPacket, StatusPacket, TimePacket,
+    ErrorNotificationPacket, MetadataPacket, MetricsDataPacket, MixerDataPacket, OptInBuilder,
+    OptInPacket, Packet, RequestDataType, RequestPacket, StatusPacket, TimePacket,
 };
 use crate::registry::{NodeKey, NodeRegistry, RegistryEvent, RemovalReason};
 use crate::types::{
