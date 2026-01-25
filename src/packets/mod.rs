@@ -3,6 +3,7 @@
 //! This module contains parsers and builders for various TCNet packet types.
 
 mod app_data;
+mod error;
 mod metadata;
 mod metrics;
 mod mixer;
@@ -12,6 +13,10 @@ mod status;
 mod time;
 
 pub use app_data::AppDataPacket;
+pub use app_data::{
+    RESOLUME_ARENA_TRAILER, RESOLUME_ARENA_XOR_KEY_PORT_65446, RESOLUME_SIGNATURE,
+};
+pub use error::{ErrorCode, ErrorNotificationPacket, ERROR_NOTIFICATION_PACKET_SIZE};
 pub use metadata::{MetadataPacket, TrackKey, METADATA_DATA_TYPE, METADATA_PACKET_SIZE};
 pub use metrics::{MetricsDataPacket, METRICS_DATA_TYPE, METRICS_DATA_PACKET_SIZE};
 pub use mixer::{
@@ -38,6 +43,8 @@ pub enum Packet {
     Status(StatusPacket),
     /// Time packet with layer timing data
     Time(TimePacket),
+    /// Error/notification packet (response to failed requests)
+    ErrorNotification(ErrorNotificationPacket),
     /// Metrics data packet with playback info
     MetricsData(MetricsDataPacket),
     /// Metadata packet with track info
@@ -65,6 +72,9 @@ impl Packet {
             MessageType::OptOut => Ok(Packet::OptOut(header)),
             MessageType::Status => Ok(Packet::Status(StatusPacket::parse(data)?)),
             MessageType::Time => Ok(Packet::Time(TimePacket::parse(data)?)),
+            MessageType::ErrorNotification => {
+                Ok(Packet::ErrorNotification(ErrorNotificationPacket::parse(data)?))
+            }
             MessageType::Data => Self::parse_data_packet(data, header),
             _ => Ok(Packet::Unknown(header)),
         }
@@ -94,6 +104,7 @@ impl Packet {
             Packet::OptOut(h) => h,
             Packet::Status(p) => &p.header,
             Packet::Time(p) => &p.header,
+            Packet::ErrorNotification(p) => &p.header,
             Packet::MetricsData(p) => &p.header,
             Packet::Metadata(p) => &p.header,
             Packet::MixerData(p) => &p.header,

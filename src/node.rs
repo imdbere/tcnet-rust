@@ -12,14 +12,16 @@ use tokio::net::UdpSocket;
 use tokio::sync::{broadcast, Mutex};
 use tracing::{debug, error, info, trace};
 
+use crate::auth::AuthManager;
 use crate::error::Result;
 use crate::packets::{
-    AppDataPacket, MetadataPacket, MetricsDataPacket, MixerDataPacket, OptInBuilder, OptInPacket,
-    Packet, RequestDataType, RequestPacket, StatusPacket, TimePacket,
+    AppDataPacket, ErrorNotificationPacket, MetadataPacket, MetricsDataPacket, MixerDataPacket,
+    OptInBuilder, OptInPacket, Packet, RequestDataType, RequestPacket, StatusPacket, TimePacket,
 };
 use crate::registry::{NodeKey, NodeRegistry, RegistryEvent, RemovalReason};
 use crate::types::{
-    NodeOptions, NodeType, PORT_BROADCAST_CONTROL, PORT_BROADCAST_TIME, PORT_UNICAST_DEFAULT,
+    MessageType, NodeOptions, NodeType, PORT_BROADCAST_CONTROL, PORT_BROADCAST_TIME,
+    PORT_UNICAST_DEFAULT,
 };
 
 /// Configuration for a TCNet node.
@@ -44,10 +46,11 @@ pub struct NodeConfig {
 impl Default for NodeConfig {
     fn default() -> Self {
         Self {
-            node_name: "Arena".to_string(),
+            node_name: "Synm".to_string(),
             node_type: NodeType::Slave,
             node_options: NodeOptions::new(),
-            listener_port: PORT_UNICAST_DEFAULT,
+            // 0 means "auto-select a free port in the TCNet unicast range"
+            listener_port: 0,
             vendor_name: "tcnet-rust".to_string(),
             app_name: "TCNet Listener".to_string(),
             app_version: (0, 1, 0),
@@ -87,6 +90,8 @@ pub enum NodeEvent {
     TimePacket(TimePacket),
     /// Received a status packet
     StatusPacket(StatusPacket),
+    /// Received an error/notification packet
+    ErrorNotificationPacket(ErrorNotificationPacket),
     /// Received a metrics data packet
     MetricsDataPacket(MetricsDataPacket),
     /// Received a metadata packet
@@ -118,15 +123,22 @@ pub enum NodeEvent {
 
 /// A TCNet node that participates in the network.
 pub struct Node {
-    config: NodeConfig,
-    node_id: u16,
+    pub(crate) config: NodeConfig,
+    pub(crate) node_id: u16,
     sequence: AtomicU8,
     node_count: AtomicU16,
+    /// Actual bound unicast listener port (advertised in Opt-IN).
+    ///
+    /// If `config.listener_port` is 0 or unavailable, we auto-select a free port in the
+    /// TCNet unicast range (65023-65535) at startup.
+    pub(crate) listener_port: AtomicU16,
     start_time: Instant,
     event_tx: broadcast::Sender<NodeEvent>,
     registry: Mutex<NodeRegistry>,
+    /// Manages authentication handshakes with peers that require it.
+    pub(crate) auth_manager: AuthManager,
     /// Socket for sending unicast subscription packets (set during run())
-    unicast_socket: Mutex<Option<Arc<UdpSocket>>>,
+    pub(crate) unicast_socket: Mutex<Option<Arc<UdpSocket>>>,
 }
 
 impl Node {
@@ -142,6 +154,7 @@ impl Node {
         let (event_tx, _) = broadcast::channel(256);
 
         Self {
+            listener_port: AtomicU16::new(config.listener_port),
             config,
             node_id,
             sequence: AtomicU8::new(0),
@@ -149,6 +162,7 @@ impl Node {
             start_time: Instant::now(),
             event_tx,
             registry: Mutex::new(NodeRegistry::new()),
+            auth_manager: AuthManager::new(),
             unicast_socket: Mutex::new(None),
         }
     }
@@ -165,7 +179,7 @@ impl Node {
     }
 
     /// Get the current timestamp in microseconds (0-999999).
-    fn timestamp_us(&self) -> u32 {
+    pub(crate) fn timestamp_us(&self) -> u32 {
         let micros = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -174,7 +188,7 @@ impl Node {
     }
 
     /// Get and increment the sequence number.
-    fn next_sequence(&self) -> u8 {
+    pub(crate) fn next_sequence(&self) -> u8 {
         self.sequence.fetch_add(1, Ordering::Relaxed)
     }
 
@@ -184,7 +198,7 @@ impl Node {
             .node_id(self.node_id)
             .node_type(self.config.node_type)
             .node_options(self.config.node_options)
-            .listener_port(self.config.listener_port)
+            .listener_port(self.listener_port.load(Ordering::Relaxed))
             .vendor(&self.config.vendor_name)
             .app_name(&self.config.app_name)
             .app_version(
@@ -214,17 +228,18 @@ impl Node {
         )
     }
 
-    /// Build Resolume-style application data packets for subscription.
-    /// Returns a pair of packets that should both be sent.
-    fn build_app_data_pair(&self) -> Vec<AppDataPacket> {
-        AppDataPacket::resolume_style_pair(
-            self.node_id,
-            &self.config.node_name,
-            self.next_sequence(),
-            self.config.node_type,
-            self.config.node_options,
-            self.timestamp_us(),
-        )
+    async fn send_opt_in_unicast(&self, socket: &UdpSocket, target_addr: SocketAddr) {
+        let packet = self.build_opt_in();
+        if let Err(e) = socket.send_to(&packet.to_bytes(), target_addr).await {
+            debug!("Failed to unicast Opt-IN to {}: {}", target_addr, e);
+        } else {
+            trace!(
+                "Unicasted Opt-IN to {} (seq: {}, listener_port: {})",
+                target_addr,
+                packet.header.sequence,
+                self.listener_port.load(Ordering::Relaxed)
+            );
+        }
     }
 
     /// Send subscription packets to a node to start receiving mixer data.
@@ -237,16 +252,6 @@ impl Node {
         };
 
         info!("Sending subscriptions to {}", target_addr);
-
-        // Send Resolume-style app data packets (subscription) - both packets are needed
-        // let app_data_packets = self.build_app_data_pair();
-        // for (i, packet) in app_data_packets.iter().enumerate() {
-        //     if let Err(e) = socket.send_to(&packet.to_bytes(), target_addr).await {
-        //         debug!("Failed to send app data packet {} to {}: {}", i + 1, target_addr, e);
-        //     } else {
-        //         trace!("Sent app data packet {} to {}", i + 1, target_addr);
-        //     }
-        // }
 
         // // Send request for layer status (type 2)
         let request_status = self.build_request(RequestDataType::LayerStatus, 1);
@@ -264,15 +269,6 @@ impl Node {
                 debug!("Failed to send metadata request to {}: {}", target_addr, e);
             }
         }
-
-        // let app_data_packets = self.build_app_data_pair();
-        // for (i, packet) in app_data_packets.iter().enumerate() {
-        //     if let Err(e) = socket.send_to(&packet.to_bytes(), target_addr).await {
-        //         debug!("Failed to send app data packet {} to {}: {}", i + 1, target_addr, e);
-        //     } else {
-        //         trace!("Sent app data packet {} to {}", i + 1, target_addr);
-        //     }
-        // }
 
         // // // Also send explicit mixer data request
         // let request_mixer = self.build_request(RequestDataType::MixerData, 0);
@@ -308,6 +304,56 @@ impl Node {
         // Convert socket2::Socket -> std::net::UdpSocket -> tokio::net::UdpSocket
         let std_socket: std::net::UdpSocket = socket.into();
         UdpSocket::from_std(std_socket)
+    }
+
+    /// Create a unicast socket bound to a specific port (no SO_REUSEPORT).
+    ///
+    /// For TCNet unicast traffic the listener port should be unique and free in the
+    /// range 65023-65535.
+    fn create_unicast_socket(port: u16) -> std::io::Result<UdpSocket> {
+        let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
+
+        // Allow address reuse (harmless for UDP), but do NOT enable SO_REUSEPORT here:
+        // we want an actually free, unique port for unicast replies.
+        socket.set_reuse_address(true)?;
+        socket.set_nonblocking(true)?;
+
+        let addr = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port);
+        socket.bind(&addr.into())?;
+
+        let std_socket: std::net::UdpSocket = socket.into();
+        UdpSocket::from_std(std_socket)
+    }
+
+    /// Select a free unicast port in the TCNet range (65023-65535) and bind to it.
+    ///
+    /// - If `preferred_port` is non-zero and within range, we try it first.
+    /// - Otherwise, we scan the range until we find a free port.
+    fn bind_unicast_in_tcnet_range(preferred_port: u16) -> std::io::Result<(UdpSocket, u16)> {
+        let start = PORT_UNICAST_DEFAULT;
+        let end = crate::types::PORT_UNICAST_MAX;
+
+        let mut candidates: Vec<u16> = Vec::with_capacity((end - start + 1) as usize);
+        if preferred_port != 0 && (start..=end).contains(&preferred_port) {
+            candidates.push(preferred_port);
+        }
+        for port in start..=end {
+            if port != preferred_port {
+                candidates.push(port);
+            }
+        }
+
+        let mut last_err: Option<std::io::Error> = None;
+        for port in candidates {
+            match Self::create_unicast_socket(port) {
+                Ok(sock) => return Ok((sock, port)),
+                Err(e) => last_err = Some(e),
+            }
+        }
+
+        Err(last_err.unwrap_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::AddrNotAvailable, "no free unicast port found")
+        }))
     }
 
     /// Emit events from registry changes.
@@ -353,12 +399,12 @@ impl Node {
         );
         let time_socket: UdpSocket = Self::create_reusable_socket(PORT_BROADCAST_TIME)?;
 
-        // Bind to our unicast listener port for receiving responses to requests
-        info!(
-            "Binding to unicast listener port {}",
-            self.config.listener_port
-        );
-        let unicast_socket: UdpSocket = Self::create_reusable_socket(self.config.listener_port)?;
+        // Bind to a free unicast listener port in the spec range (65023-65535)
+        let preferred = self.config.listener_port;
+        let (unicast_socket, bound_port) = Self::bind_unicast_in_tcnet_range(preferred)?;
+        self.listener_port.store(bound_port, Ordering::Relaxed);
+        info!("Bound unicast listener port {}", bound_port);
+
         let unicast_socket: Arc<UdpSocket> = Arc::new(unicast_socket);
 
         // Store unicast socket for sending subscriptions
@@ -383,8 +429,24 @@ impl Node {
             self.config.node_name,
             PORT_BROADCAST_CONTROL,
             PORT_BROADCAST_TIME,
-            self.config.listener_port
+            self.listener_port.load(Ordering::Relaxed)
         );
+
+        // Send an Opt-IN immediately so peers learn our chosen unicast port ASAP.
+        // Some devices appear to reply (unicast) based on the listener port advertised in Opt-IN,
+        // not the UDP source port of the first application-specific packet.
+        {
+            let packet = self.build_opt_in();
+            if let Err(e) = send_socket.send_to(&packet.to_bytes(), broadcast_addr).await {
+                error!("Failed to send initial Opt-IN: {}", e);
+            } else {
+                trace!(
+                    "Sent initial Opt-IN packet (seq: {}, listener_port: {})",
+                    packet.header.sequence,
+                    self.listener_port.load(Ordering::Relaxed)
+                );
+            }
+        }
 
         // Spawn Opt-IN sender task
         let node_clone = Arc::clone(&self);
@@ -401,6 +463,28 @@ impl Node {
                     error!("Failed to send Opt-IN: {}", e);
                 } else {
                     trace!("Sent Opt-IN packet (seq: {})", packet.header.sequence);
+                }
+            }
+        });
+
+        // Unicast Opt-IN to discovered nodes (spec-recommended) so nodes that don't receive
+        // broadcasts still learn our listener port.
+        let node_clone = Arc::clone(&self);
+        let send_socket_clone = Arc::clone(&send_socket);
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(1));
+            loop {
+                interval.tick().await;
+                let targets = {
+                    let registry = node_clone.registry.lock().await;
+                    registry
+                        .nodes()
+                        .map(|n| SocketAddr::new(n.address.ip(), n.listener_port))
+                        .collect::<Vec<_>>()
+                };
+
+                for target in targets {
+                    node_clone.send_opt_in_unicast(&send_socket_clone, target).await;
                 }
             }
         });
@@ -425,6 +509,28 @@ impl Node {
                 }
             }
         });
+
+        // Spawn Arena-style keepalive: every 1s, send step0 ONLY to peers where the
+        // NEED_AUTHENTICATION handshake has completed.
+        // let node_clone = Arc::clone(&self);
+        // tokio::spawn(async move {
+        //     let mut interval = tokio::time::interval(Duration::from_secs(1));
+        //     loop {
+        //         interval.tick().await;
+        //         let targets = {
+        //             let peers = node_clone.auth_peers.lock().await;
+        //             peers
+        //                 .values()
+        //                 .filter(|p| p.handshake_complete)
+        //                 .map(|p| p.target_addr)
+        //                 .collect::<Vec<_>>()
+        //         };
+
+        //         for target in targets {
+        //             node_clone.send_arena_a6ff_step0_unicast(target).await;
+        //         }
+        //     }
+        // });
 
         // Spawn control port listener
         let node_clone = Arc::clone(&self);
@@ -456,6 +562,7 @@ impl Node {
             loop {
                 match unicast_socket_clone.recv_from(&mut buf).await {
                     Ok((len, addr)) => {
+                        trace!("Received unicast packet from {} (len: {})", addr, len);
                         if len >= 8 {
                             trace!("Unicast packet from {}: len={}, type={}", addr, len, buf[7]);
                         }
@@ -527,6 +634,18 @@ impl Node {
 
                 let _ = self.event_tx.send(NodeEvent::StatusPacket(status_packet));
             }
+            Packet::ErrorNotification(error_packet) => {
+                debug!(
+                    "Received error/notification from {}: {} (code: {}, request: {})",
+                    error_packet.header.node_name_str(),
+                    error_packet.request_description(),
+                    error_packet.code,
+                    error_packet.request_message_type,
+                );
+                let _ = self
+                    .event_tx
+                    .send(NodeEvent::ErrorNotificationPacket(error_packet));
+            }
             Packet::OptIn(opt_in) => {
                 let node_name = opt_in.header.node_name_str();
                 let key = NodeKey::new(addr, node_name.clone());
@@ -545,7 +664,7 @@ impl Node {
                 let event = {
                     let mut registry = self.registry.lock().await;
                     registry.update_node(
-                        key,
+                        key.clone(),
                         node_name,
                         node_type,
                         opt_in.header.node_id,
@@ -570,13 +689,25 @@ impl Node {
                         self.send_subscriptions(target_addr).await;
                     }
                 }
+
+                // If the peer advertises NEED_AUTHENTICATION (flag 1), initiate the Arena-style
+                // handshake once per peer, then switch to keepalives after completion.
+                if opt_in.header.node_options.needs_auth() {
+                    let target_addr = SocketAddr::new(addr.ip(), listener_port);
+                    self.initiate_auth_handshake(key, target_addr, &opt_in.header.node_name_str())
+                        .await;
+                }
             }
             Packet::OptOut(header) => {
                 let node_name = header.node_name_str();
                 info!("Received Opt-OUT from {} ({})", node_name, addr);
 
+                let key = NodeKey::new(addr, node_name.clone());
+
+                // Remove auth tracking for this peer
+                self.remove_auth_peer(&key).await;
+
                 // Remove from registry
-                let key = NodeKey::new(addr, node_name);
                 let event = {
                     let mut registry = self.registry.lock().await;
                     registry.remove_node(&key)
@@ -599,11 +730,10 @@ impl Node {
             }
             Packet::Metadata(metadata_packet) => {
                 debug!(
-                    "Received metadata from {} (layer: {}, track: {}) {:#?}",
+                    "Received metadata from {} (layer: {}, track: {})",
                     metadata_packet.header.node_name_str(),
                     metadata_packet.layer,
-                    metadata_packet.display_string(),
-                    metadata_packet
+                    metadata_packet.display_string()
                 );
                 let _ = self
                     .event_tx
@@ -618,10 +748,15 @@ impl Node {
                 let _ = self.event_tx.send(NodeEvent::MixerDataPacket(mixer_packet));
             }
             Packet::Unknown(header) => {
-                debug!(
-                    "Received unknown packet type {:?} from {}",
-                    header.message_type, addr
-                );
+                if header.message_type == MessageType::ApplicationData {
+                    trace!("Received AppData packet from {} (addr: {})", header.node_name_str(), addr);
+                    self.handle_auth_app_data(data, addr, &header).await;
+                } else {
+                    debug!(
+                        "Received unknown packet type {:?} from {}",
+                        header.message_type, addr
+                    );
+                }
             }
         }
 

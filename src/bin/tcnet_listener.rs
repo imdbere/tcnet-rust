@@ -16,7 +16,7 @@ use tracing_subscriber::EnvFilter;
 #[command(author, version, about, long_about = None)]
 struct Args {
     /// Node name (max 8 characters)
-    #[arg(short, long, default_value = "Arena")]
+    #[arg(short, long, default_value = "Synm")]
     name: String,
 
     /// Show all layers, not just active ones
@@ -161,7 +161,7 @@ async fn main() -> tcnet::Result<()> {
     let config = NodeConfig::new(&args.name)
         .with_type(NodeType::Slave)
         .with_vendor("Resolume")
-        .with_app("Arena", (7, 23, 2));
+        .with_app("Synm", (7, 23, 2));
 
     info!("Starting TCNet listener as node '{}'", args.name);
     info!("Listening for time packets on UDP port 60001");
@@ -202,6 +202,16 @@ async fn main() -> tcnet::Result<()> {
                             status.auto_master_mode_str()
                         );
                     }
+                }
+                NodeEvent::ErrorNotificationPacket(error) => {
+                    // Always show errors, they're important
+                    error!(
+                        "Error from {} {} (code: {}) {:#?}",
+                        error.header.node_name_str(),
+                        error.request_description(),
+                        error.code,
+                        error,
+                    );
                 }
                 NodeEvent::MetricsDataPacket(metrics) => {
                     if show_nodes {

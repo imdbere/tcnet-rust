@@ -208,6 +208,27 @@ pub struct RawOnAirData {
 }
 
 // ============================================================================
+// Error/Notification Packet (30 bytes) - Message Type 13
+// ============================================================================
+
+/// Raw Error/Notification packet as it appears on the wire (30 bytes).
+#[binread]
+#[br(little)]
+#[derive(Debug, Clone)]
+pub struct RawErrorNotificationPacket {
+    /// Management header (bytes 0-23)
+    pub header: RawManagementHeader,
+    /// Data type of the original request (byte 24)
+    pub data_type: u8,
+    /// Layer ID of the original request (byte 25)
+    pub layer_id: u8,
+    /// Error/notification code (bytes 26-27)
+    pub code: u16,
+    /// Message type of the original request (bytes 28-29)
+    pub request_message_type: u16,
+}
+
+// ============================================================================
 // Metrics Data Packet (122 bytes) - Data Type 2
 // ============================================================================
 

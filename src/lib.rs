@@ -49,6 +49,7 @@
 //!
 //! This implementation targets TCNet protocol version 3.5.1B.
 
+pub mod auth;
 pub mod error;
 pub mod header;
 pub mod node;
@@ -62,8 +63,9 @@ pub use error::{Result, TcNetError};
 pub use header::ManagementHeader;
 pub use node::{Node, NodeConfig, NodeEvent};
 pub use packets::{
-    LayerStatus, LayerTimeData, MetadataPacket, MetricsDataPacket, MixerChannel, MixerDataPacket,
-    MixerType, OptInPacket, Packet, StatusPacket, TimePacket, TrackKey,
+    ErrorCode, ErrorNotificationPacket, LayerStatus, LayerTimeData, MetadataPacket,
+    MetricsDataPacket, MixerChannel, MixerDataPacket, MixerType, OptInPacket, Packet, StatusPacket,
+    TimePacket, TrackKey,
 };
 pub use registry::{NodeInfo, NodeRegistry, RegistryEvent, RemovalReason};
 pub use types::{

@@ -194,7 +194,7 @@ impl OptInBuilder {
             node_options: NodeOptions::new(),
             listener_port: PORT_UNICAST_DEFAULT,
             vendor_name: "Resolume".to_string(),
-            app_name: "Arena".to_string(),
+            app_name: "Synm".to_string(),
             app_version: (
                 7,
                 23,
