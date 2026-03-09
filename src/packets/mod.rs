@@ -13,9 +13,7 @@ mod status;
 mod time;
 
 pub use app_data::AppDataPacket;
-pub use app_data::{
-    RESOLUME_ARENA_TRAILER, RESOLUME_ARENA_XOR_KEY_PORT_65446, RESOLUME_SIGNATURE,
-};
+pub use app_data::{compute_auth_xor_key, RESOLUME_ARENA_TRAILER, RESOLUME_SIGNATURE};
 pub use error::{ErrorCode, ErrorNotificationPacket, ERROR_NOTIFICATION_PACKET_SIZE};
 pub use metadata::{MetadataPacket, TrackKey, METADATA_DATA_TYPE, METADATA_PACKET_SIZE};
 pub use metrics::{MetricsDataPacket, METRICS_DATA_TYPE, METRICS_DATA_PACKET_SIZE};

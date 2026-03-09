@@ -601,7 +601,7 @@ impl Node {
 
         match packet {
             Packet::Time(time_packet) => {
-                trace!(
+                debug!(
                     "Received time packet from {} ({})",
                     time_packet.header.node_name_str(),
                     addr
@@ -740,11 +740,17 @@ impl Node {
                     .send(NodeEvent::MetadataPacket(metadata_packet));
             }
             Packet::MixerData(mixer_packet) => {
-                debug!(
-                    "Received mixer data from {} (mixer: {})",
-                    mixer_packet.header.node_name_str(),
-                    mixer_packet.mixer_name,
-                );
+                // debug!(
+                //     "Received mixer data from {} (mixer: {})",
+                //     mixer_packet.header.node_name_str(),
+                //     mixer_packet.mixer_name,
+                // );
+                // debug!(
+                //     "Received mixer data from {} (mixer: {}) {:#?}",
+                //     mixer_packet.header.node_name_str(),
+                //     mixer_packet.mixer_name,
+                //     mixer_packet
+                // );
                 let _ = self.event_tx.send(NodeEvent::MixerDataPacket(mixer_packet));
             }
             Packet::Unknown(header) => {

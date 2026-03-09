@@ -29,7 +29,7 @@ use tracing::{debug, info, trace};
 
 use crate::header::ManagementHeader;
 use crate::node::Node;
-use crate::packets::{AppDataPacket, RESOLUME_ARENA_XOR_KEY_PORT_65446};
+use crate::packets::{compute_auth_xor_key, AppDataPacket};
 use crate::registry::NodeKey;
 
 /// Pioneer's registered application code (observed in Packet Signature field).
@@ -152,7 +152,16 @@ impl Node {
     }
 
     /// Build an Arena-style step=2 response packet.
-    pub(crate) fn build_auth_step2(&self, challenge: u32) -> AppDataPacket {
+    pub(crate) fn build_auth_step2(
+        &self,
+        challenge: u32,
+        local_ip: std::net::Ipv4Addr,
+    ) -> AppDataPacket {
+        let xor_key = compute_auth_xor_key(local_ip);
+        debug!(
+            "Auth step2: challenge=0x{:08x}, local_ip={}, xor_key=0x{:08x}",
+            challenge, local_ip, xor_key
+        );
         AppDataPacket::resolume_arena_step2(
             self.node_id,
             &self.config.node_name,
@@ -162,7 +171,7 @@ impl Node {
             self.timestamp_us(),
             self.listener_port.load(Ordering::Relaxed),
             challenge,
-            RESOLUME_ARENA_XOR_KEY_PORT_65446,
+            xor_key,
         )
     }
 
@@ -187,14 +196,19 @@ impl Node {
     }
 
     /// Send an Arena-style step=2 response to a peer.
-    pub(crate) async fn send_auth_step2(&self, target_addr: SocketAddr, challenge: u32) {
+    pub(crate) async fn send_auth_step2(
+        &self,
+        target_addr: SocketAddr,
+        challenge: u32,
+        local_ip: std::net::Ipv4Addr,
+    ) {
         let socket_guard = self.unicast_socket.lock().await;
         let Some(socket) = socket_guard.as_ref() else {
             debug!("Cannot send auth step2: unicast socket not initialized");
             return;
         };
 
-        let packet = self.build_auth_step2(challenge);
+        let packet = self.build_auth_step2(challenge, local_ip);
         if let Err(e) = socket.send_to(&packet.to_bytes(), target_addr).await {
             debug!(
                 "Failed to send auth step2 to {} (challenge: 0x{:08x}): {}",
@@ -263,8 +277,23 @@ impl Node {
                 addr, challenge
             );
 
+            // Determine our local IP that can reach the peer.
+            // We connect a temporary UDP socket to the peer address to let the OS
+            // select the correct source interface, then read back the local address.
+            let local_ip = {
+                let probe = std::net::UdpSocket::bind("0.0.0.0:0").ok();
+                probe
+                    .and_then(|s| s.connect(addr).ok().map(|_| s))
+                    .and_then(|s| s.local_addr().ok())
+                    .and_then(|a| match a {
+                        SocketAddr::V4(v4) => Some(*v4.ip()),
+                        _ => None,
+                    })
+                    .unwrap_or(std::net::Ipv4Addr::UNSPECIFIED)
+            };
+
             // Respond with step=2
-            self.send_auth_step2(addr, challenge).await;
+            self.send_auth_step2(addr, challenge, local_ip).await;
 
             // Mark handshake complete for this peer
             let peer_name = header.node_name_str();

@@ -28,9 +28,38 @@ pub const RESOLUME_SIGNATURE: u32 = 0x0abc_0000;
 /// Observed constant trailer for Arena step=2 responses.
 pub const RESOLUME_ARENA_TRAILER: [u8; 8] = [0x0b, 0x48, 0xc8, 0x5a, 0x96, 0x96, 0xa0, 0xfc];
 
-/// Observed XOR key for the captured case where Arena's listener port was 65446 (0xFFA6).
-/// For step=2: `response_u32 = challenge_u32 XOR RESOLUME_ARENA_XOR_KEY_PORT_65446`.
-pub const RESOLUME_ARENA_XOR_KEY_PORT_65446: u32 = 0x2e11_b081;
+/// Compute the XOR key for the Arena-style auth response.
+///
+/// The key is derived from the Resolume application signature and the local node's
+/// IPv4 address using two independent FNV-1a (32-bit) hash chains XORed together:
+///
+///   xor_key = FNV-1a(sig_lo, sig_hi) ^ FNV-1a(ip[0], ip[1], ip[2], ip[3])
+///
+/// where `sig_lo`/`sig_hi` are the low/high bytes of `RESOLUME_SIGNATURE >> 16` (i.e. 0x0ABC),
+/// and `ip` is the node's IPv4 address in network byte order.
+pub fn compute_auth_xor_key(local_ip: std::net::Ipv4Addr) -> u32 {
+    const FNV_OFFSET: u32 = 0x811C_9DC5;
+    const FNV_PRIME: u32 = 0x0100_0193;
+
+    #[inline]
+    fn fnv1a(data: &[u8]) -> u32 {
+        let mut h = FNV_OFFSET;
+        for &b in data {
+            h ^= b as u32;
+            h = h.wrapping_mul(FNV_PRIME);
+        }
+        h
+    }
+
+    // Chain A: low 2 bytes of signature (0x0ABC → [0xBC, 0x0A])
+    let sig = (RESOLUME_SIGNATURE >> 16) as u16;
+    let chain_a = fnv1a(&sig.to_le_bytes());
+
+    // Chain B: IPv4 address in network (big-endian) byte order
+    let chain_b = fnv1a(&local_ip.octets());
+
+    chain_a ^ chain_b
+}
 
 /// Application Specific Data packet.
 #[derive(Debug, Clone)]
