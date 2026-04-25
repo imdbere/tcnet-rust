@@ -12,6 +12,9 @@ use tokio::net::UdpSocket;
 use tokio::sync::{broadcast, Mutex};
 use tracing::{debug, error, info, trace};
 
+const UDP_RECV_BUFFER_SIZE_BYTES: usize = 1024 * 1024;
+const UDP_UNICAST_READ_BUFFER_BYTES: usize = 65535;
+
 use crate::auth::AuthManager;
 use crate::error::Result;
 use crate::packets::{
@@ -287,12 +290,14 @@ impl Node {
         // Allow address reuse - required for multiple processes to bind to same port
         socket.set_reuse_address(true)?;
 
-        // Enable SO_REUSEPORT - allows multiple sockets to receive the same broadcast packets
-        // This is key for coexisting with other TCNet apps like Pro DJ Link Bridge
+        // Enable SO_REUSEPORT on non-Windows platforms so multiple sockets
+        // can receive the same broadcast packets (e.g. alongside Bridge).
+        #[cfg(not(windows))]
         socket.set_reuse_port(true)?;
 
         // Enable broadcast receiving
         socket.set_broadcast(true)?;
+        socket.set_recv_buffer_size(UDP_RECV_BUFFER_SIZE_BYTES)?;
 
         // Set non-blocking for tokio compatibility
         socket.set_nonblocking(true)?;
@@ -316,6 +321,7 @@ impl Node {
         // Allow address reuse (harmless for UDP), but do NOT enable SO_REUSEPORT here:
         // we want an actually free, unique port for unicast replies.
         socket.set_reuse_address(true)?;
+        socket.set_recv_buffer_size(UDP_RECV_BUFFER_SIZE_BYTES)?;
         socket.set_nonblocking(true)?;
 
         let addr = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port);
@@ -558,7 +564,7 @@ impl Node {
         let node_clone = Arc::clone(&self);
         let unicast_socket_clone = Arc::clone(&unicast_socket);
         tokio::spawn(async move {
-            let mut buf = [0u8; 4096]; // Larger buffer for data packets like waveforms
+            let mut buf = [0u8; UDP_UNICAST_READ_BUFFER_BYTES];
             loop {
                 match unicast_socket_clone.recv_from(&mut buf).await {
                     Ok((len, addr)) => {
