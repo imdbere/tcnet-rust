@@ -6,7 +6,6 @@
 use std::io::Cursor;
 
 use binrw::BinRead;
-use tracing::info;
 
 use crate::error::{Result, TcNetError};
 use crate::header::ManagementHeader;

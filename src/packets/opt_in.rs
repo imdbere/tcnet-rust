@@ -9,8 +9,7 @@ use binrw::BinRead;
 use crate::error::{Result, TcNetError};
 use crate::header::ManagementHeader;
 use crate::types::{
-    MessageType, NodeOptions, NodeType, OPT_IN_PACKET_SIZE, PORT_UNICAST_DEFAULT,
-    PROTOCOL_VERSION_MAJOR, PROTOCOL_VERSION_MINOR,
+    MessageType, NodeOptions, NodeType, OPT_IN_PACKET_SIZE, PORT_UNICAST_DEFAULT
 };
 use crate::wire::RawOptInPacket;
 

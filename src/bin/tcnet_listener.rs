@@ -171,8 +171,8 @@ async fn main() -> tcnet::Result<()> {
     let mut events = node.subscribe();
 
     // Spawn event handler
-    let show_all = args.all_layers;
     let compact = args.compact;
+    let show_all = args.all_layers;
     let show_nodes = args.show_nodes;
 
     tokio::spawn(async move {
@@ -191,7 +191,7 @@ async fn main() -> tcnet::Result<()> {
                         last_source = Some(source);
                     }
 
-                    //print_time_packet(&packet, show_all, compact);
+                    print_time_packet(&packet, show_all, compact);
                 }
                 NodeEvent::StatusPacket(status) => {
                     if show_nodes {
