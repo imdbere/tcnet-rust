@@ -3,20 +3,24 @@
 //! A node represents this application's presence on the TCNet network.
 
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
-use std::sync::atomic::{AtomicU16, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use socket2::{Domain, Protocol, Socket, Type};
+use tokio::task::JoinHandle;
 use tokio::net::UdpSocket;
 use tokio::sync::{broadcast, Mutex};
 use tracing::{debug, error, info, trace};
 
-const UDP_RECV_BUFFER_SIZE_BYTES: usize = 1024 * 1024;
-const UDP_UNICAST_READ_BUFFER_BYTES: usize = 65535;
+const UDP_RECV_BUFFER_SIZE_BYTES: usize = 4 * 1024;
+const UDP_UNICAST_READ_BUFFER_BYTES: usize = 65535 / 4;
+const SOCKET_POLL_TIMEOUT: Duration = Duration::from_millis(200);
+const GRACEFUL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
 
 use crate::auth::AuthManager;
 use crate::error::Result;
+use crate::header::ManagementHeader;
 use crate::packets::{
     ErrorNotificationPacket, MetadataPacket, MetricsDataPacket, MixerDataPacket, OptInBuilder,
     OptInPacket, Packet, RequestDataType, RequestPacket, StatusPacket, TimePacket,
@@ -142,6 +146,7 @@ pub struct Node {
     pub(crate) auth_manager: AuthManager,
     /// Socket for sending unicast subscription packets (set during run())
     pub(crate) unicast_socket: Mutex<Option<Arc<UdpSocket>>>,
+    shutdown_requested: AtomicBool,
 }
 
 impl Node {
@@ -167,12 +172,21 @@ impl Node {
             registry: Mutex::new(NodeRegistry::new()),
             auth_manager: AuthManager::new(),
             unicast_socket: Mutex::new(None),
+            shutdown_requested: AtomicBool::new(false),
         }
     }
 
     /// Subscribe to node events.
     pub fn subscribe(&self) -> broadcast::Receiver<NodeEvent> {
         self.event_tx.subscribe()
+    }
+
+    pub fn request_shutdown(&self) {
+        self.shutdown_requested.store(true, Ordering::Relaxed);
+    }
+
+    fn is_shutdown_requested(&self) -> bool {
+        self.shutdown_requested.load(Ordering::Relaxed)
     }
 
     /// Get the current uptime in seconds (rolls over every 12 hours as per spec).
@@ -231,6 +245,62 @@ impl Node {
         )
     }
 
+    fn build_opt_out_bytes(&self) -> Vec<u8> {
+        let header = ManagementHeader::new(
+            self.node_id,
+            MessageType::OptOut,
+            &self.config.node_name,
+            self.next_sequence(),
+            self.config.node_type,
+            self.config.node_options,
+            self.timestamp_us(),
+        )
+        .to_bytes();
+        let mut bytes = Vec::with_capacity(28);
+        bytes.extend_from_slice(&header);
+        bytes.extend_from_slice(&self.node_count.load(Ordering::Relaxed).to_le_bytes());
+        bytes.extend_from_slice(&self.listener_port.load(Ordering::Relaxed).to_le_bytes());
+        bytes
+    }
+
+    pub async fn send_opt_out_once(&self) {
+        let socket = match UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)).await {
+            Ok(socket) => socket,
+            Err(err) => {
+                debug!("Failed to bind UDP socket for Opt-OUT: {}", err);
+                return;
+            }
+        };
+        if let Err(err) = socket.set_broadcast(true) {
+            debug!("Failed to enable broadcast for Opt-OUT: {}", err);
+            return;
+        }
+
+        let packet = self.build_opt_out_bytes();
+        let broadcast_addr = SocketAddr::V4(SocketAddrV4::new(
+            Ipv4Addr::BROADCAST,
+            PORT_BROADCAST_CONTROL,
+        ));
+        if let Err(err) = socket.send_to(&packet, broadcast_addr).await {
+            debug!("Failed to send Opt-OUT broadcast: {}", err);
+        }
+
+        let targets = {
+            let registry = self.registry.lock().await;
+            registry
+                .nodes()
+                .map(|n| SocketAddr::new(n.address.ip(), n.listener_port))
+                .collect::<Vec<_>>()
+        };
+        for target in targets {
+            if let Err(err) = socket.send_to(&packet, target).await {
+                debug!("Failed to send Opt-OUT unicast to {}: {}", target, err);
+            }
+        }
+
+        trace!("Sent Opt-OUT packet (broadcast + {} unicast)", packet.len());
+    }
+
     async fn send_opt_in_unicast(&self, socket: &UdpSocket, target_addr: SocketAddr) {
         let packet = self.build_opt_in();
         if let Err(e) = socket.send_to(&packet.to_bytes(), target_addr).await {
@@ -263,7 +333,7 @@ impl Node {
         }
 
         // // Send request for metadata (type 4)
-        for layer in 1..8 {
+        for layer in 1..=8 {
             let request_metadata = self.build_request(RequestDataType::Metadata, layer);
             if let Err(e) = socket
                 .send_to(&request_metadata.to_bytes(), target_addr)
@@ -273,11 +343,11 @@ impl Node {
             }
         }
 
-        // // // Also send explicit mixer data request
-        // let request_mixer = self.build_request(RequestDataType::MixerData, 0);
-        // if let Err(e) = socket.send_to(&request_mixer.to_bytes(), target_addr).await {
-        //     debug!("Failed to send mixer data request to {}: {}", target_addr, e);
-        // }
+        // Also send explicit mixer data request.
+        let request_mixer = self.build_request(RequestDataType::MixerData, 0);
+        if let Err(e) = socket.send_to(&request_mixer.to_bytes(), target_addr).await {
+            debug!("Failed to send mixer data request to {}: {}", target_addr, e);
+        }
 
         debug!("Sent all subscription packets to {}", target_addr);
     }
@@ -391,6 +461,7 @@ impl Node {
 
     /// Run the node, listening for packets and sending Opt-IN messages.
     pub async fn run(self: Arc<Self>) -> Result<()> {
+        self.shutdown_requested.store(false, Ordering::Relaxed);
         // Bind to broadcast ports with SO_REUSEADDR/SO_REUSEPORT
         // This allows coexistence with other TCNet apps (e.g., Pro DJ Link Bridge)
         info!(
@@ -437,6 +508,7 @@ impl Node {
             PORT_BROADCAST_TIME,
             self.listener_port.load(Ordering::Relaxed)
         );
+        let mut runtime_tasks: Vec<JoinHandle<()>> = Vec::new();
 
         // Send an Opt-IN immediately so peers learn our chosen unicast port ASAP.
         // Some devices appear to reply (unicast) based on the listener port advertised in Opt-IN,
@@ -458,10 +530,13 @@ impl Node {
         let node_clone = Arc::clone(&self);
         let send_socket_clone = Arc::clone(&send_socket);
 
-        tokio::spawn(async move {
+        runtime_tasks.push(tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_millis(500));
             loop {
                 interval.tick().await;
+                if node_clone.is_shutdown_requested() {
+                    break;
+                }
                 let packet = node_clone.build_opt_in();
                 let bytes = packet.to_bytes();
 
@@ -471,16 +546,19 @@ impl Node {
                     trace!("Sent Opt-IN packet (seq: {})", packet.header.sequence);
                 }
             }
-        });
+        }));
 
         // Unicast Opt-IN to discovered nodes (spec-recommended) so nodes that don't receive
         // broadcasts still learn our listener port.
         let node_clone = Arc::clone(&self);
         let send_socket_clone = Arc::clone(&send_socket);
-        tokio::spawn(async move {
+        runtime_tasks.push(tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(1));
             loop {
                 interval.tick().await;
+                if node_clone.is_shutdown_requested() {
+                    break;
+                }
                 let targets = {
                     let registry = node_clone.registry.lock().await;
                     registry
@@ -493,14 +571,17 @@ impl Node {
                     node_clone.send_opt_in_unicast(&send_socket_clone, target).await;
                 }
             }
-        });
+        }));
 
         // Spawn registry cleanup task (remove stale nodes)
         let node_clone = Arc::clone(&self);
-        tokio::spawn(async move {
+        runtime_tasks.push(tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(5));
             loop {
                 interval.tick().await;
+                if node_clone.is_shutdown_requested() {
+                    break;
+                }
                 let events = {
                     let mut registry = node_clone.registry.lock().await;
                     let events = registry.cleanup_stale_nodes();
@@ -514,7 +595,7 @@ impl Node {
                     node_clone.emit_registry_event(event);
                 }
             }
-        });
+        }));
 
         // Spawn Arena-style keepalive: every 1s, send step0 ONLY to peers where the
         // NEED_AUTHENTICATION handshake has completed.
@@ -540,34 +621,50 @@ impl Node {
 
         // Spawn control port listener
         let node_clone = Arc::clone(&self);
-        tokio::spawn(async move {
+        runtime_tasks.push(tokio::spawn(async move {
             let mut buf = [0u8; 1500];
             loop {
-                match control_socket.recv_from(&mut buf).await {
-                    Ok((len, addr)) => {
-                        // Log raw packet type for debugging
+                if node_clone.is_shutdown_requested() {
+                    break;
+                }
+                match tokio::time::timeout(SOCKET_POLL_TIMEOUT, control_socket.recv_from(&mut buf))
+                    .await
+                {
+                    Ok(Ok((len, addr))) => {
                         if len >= 8 {
-                            trace!("Control packet from {}: len={}, type={}", addr, len, buf[7]);
+                            trace!(
+                                "Control packet from {}: len={}, type={}",
+                                addr, len, buf[7]
+                            );
                         }
                         if let Err(e) = node_clone.handle_packet(&buf[..len], addr).await {
                             debug!("Failed to parse control packet from {}: {}", addr, e);
                         }
                     }
-                    Err(e) => {
+                    Ok(Err(e)) => {
                         error!("Control socket error: {}", e);
                     }
+                    Err(_) => {}
                 }
             }
-        });
+        }));
 
         // Spawn unicast listener for responses to request packets
         let node_clone = Arc::clone(&self);
         let unicast_socket_clone = Arc::clone(&unicast_socket);
-        tokio::spawn(async move {
+        runtime_tasks.push(tokio::spawn(async move {
             let mut buf = [0u8; UDP_UNICAST_READ_BUFFER_BYTES];
             loop {
-                match unicast_socket_clone.recv_from(&mut buf).await {
-                    Ok((len, addr)) => {
+                if node_clone.is_shutdown_requested() {
+                    break;
+                }
+                match tokio::time::timeout(
+                    SOCKET_POLL_TIMEOUT,
+                    unicast_socket_clone.recv_from(&mut buf),
+                )
+                .await
+                {
+                    Ok(Ok((len, addr))) => {
                         trace!("Received unicast packet from {} (len: {})", addr, len);
                         if len >= 8 {
                             trace!("Unicast packet from {}: len={}, type={}", addr, len, buf[7]);
@@ -576,29 +673,45 @@ impl Node {
                             debug!("Failed to parse unicast packet from {}: {}", addr, e);
                         }
                     }
-                    Err(e) => {
+                    Ok(Err(e)) => {
                         error!("Unicast socket error: {}", e);
                     }
+                    Err(_) => {}
                 }
             }
-        });
+        }));
 
         // Main loop: listen for time packets
         let mut buf = [0u8; 1500];
         loop {
-            match time_socket.recv_from(&mut buf).await {
-                Ok((len, addr)) => {
+            if self.is_shutdown_requested() {
+                break;
+            }
+            match tokio::time::timeout(SOCKET_POLL_TIMEOUT, time_socket.recv_from(&mut buf)).await
+            {
+                Ok(Ok((len, addr))) => {
                     //debug!("Received time packet from {}", addr);
                     if let Err(e) = self.handle_packet(&buf[..len], addr).await {
                         debug!("Failed to parse time packet from {}: {}", addr, e);
                     }
                 }
-                Err(e) => {
+                Ok(Err(e)) => {
                     error!("Time socket error: {}", e);
                     return Err(crate::error::TcNetError::Io(e));
                 }
+                Err(_) => {}
             }
         }
+        for task in runtime_tasks.iter_mut() {
+            if tokio::time::timeout(GRACEFUL_SHUTDOWN_TIMEOUT, &mut *task)
+                .await
+                .is_err()
+            {
+                task.abort();
+            }
+        }
+
+        Ok(())
     }
 
     /// Handle an incoming packet.
@@ -687,8 +800,9 @@ impl Node {
                 if let Some(ref event) = event {
                     self.emit_registry_event(event.clone());
 
-                    // If a new Master/Repeater was discovered, send subscription packets
-                    if matches!(event, RegistryEvent::NodeDiscovered(_))
+                    // For Master/Repeater peers, refresh subscriptions on both
+                    // discovery and updates so reconnects recover metadata/mixer streams.
+                    if matches!(event, RegistryEvent::NodeDiscovered(_) | RegistryEvent::NodeUpdated(_))
                         && (node_type == NodeType::Master || node_type == NodeType::Repeater)
                     {
                         let target_addr = SocketAddr::new(addr.ip(), listener_port);
