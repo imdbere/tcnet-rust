@@ -48,6 +48,8 @@ pub struct NodeConfig {
     pub app_name: String,
     /// Application version (major, minor, bug)
     pub app_version: (u8, u8, u8),
+    /// When set, UDP sockets bind to this IPv4 instead of all interfaces.
+    pub bind_ipv4: Option<Ipv4Addr>,
 }
 
 impl Default for NodeConfig {
@@ -61,6 +63,7 @@ impl Default for NodeConfig {
             vendor_name: "tcnet-rust".to_string(),
             app_name: "TCNet Listener".to_string(),
             app_version: (0, 1, 0),
+            bind_ipv4: None,
         }
     }
 }
@@ -86,6 +89,11 @@ impl NodeConfig {
     pub fn with_app(mut self, name: &str, version: (u8, u8, u8)) -> Self {
         self.app_name = name.to_string();
         self.app_version = version;
+        self
+    }
+
+    pub fn with_bind_ipv4(mut self, bind_ipv4: Option<Ipv4Addr>) -> Self {
+        self.bind_ipv4 = bind_ipv4;
         self
     }
 }
@@ -264,7 +272,8 @@ impl Node {
     }
 
     pub async fn send_opt_out_once(&self) {
-        let socket = match UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)).await {
+        let bind_ipv4 = Self::bind_ipv4_addr(self.config.bind_ipv4);
+        let socket = match UdpSocket::bind(SocketAddrV4::new(bind_ipv4, 0)).await {
             Ok(socket) => socket,
             Err(err) => {
                 debug!("Failed to bind UDP socket for Opt-OUT: {}", err);
@@ -354,7 +363,14 @@ impl Node {
 
     /// Create a UDP socket with SO_REUSEADDR and SO_REUSEPORT for sharing ports with other apps.
     /// This allows multiple applications (like Pro DJ Link Bridge) to receive broadcasts on the same port.
-    fn create_reusable_socket(port: u16) -> std::io::Result<UdpSocket> {
+    fn bind_ipv4_addr(bind_ipv4: Option<Ipv4Addr>) -> Ipv4Addr {
+        bind_ipv4.unwrap_or(Ipv4Addr::UNSPECIFIED)
+    }
+
+    fn create_reusable_socket(
+        port: u16,
+        bind_ipv4: Option<Ipv4Addr>,
+    ) -> std::io::Result<UdpSocket> {
         let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
 
         // Allow address reuse - required for multiple processes to bind to same port
@@ -373,7 +389,7 @@ impl Node {
         socket.set_nonblocking(true)?;
 
         // Bind to the port
-        let addr = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port);
+        let addr = SocketAddrV4::new(Self::bind_ipv4_addr(bind_ipv4), port);
         socket.bind(&addr.into())?;
 
         // Convert socket2::Socket -> std::net::UdpSocket -> tokio::net::UdpSocket
@@ -385,7 +401,7 @@ impl Node {
     ///
     /// For TCNet unicast traffic the listener port should be unique and free in the
     /// range 65023-65535.
-    fn create_unicast_socket(port: u16) -> std::io::Result<UdpSocket> {
+    fn create_unicast_socket(port: u16, bind_ipv4: Option<Ipv4Addr>) -> std::io::Result<UdpSocket> {
         let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
 
         // Allow address reuse (harmless for UDP), but do NOT enable SO_REUSEPORT here:
@@ -394,7 +410,7 @@ impl Node {
         socket.set_recv_buffer_size(UDP_RECV_BUFFER_SIZE_BYTES)?;
         socket.set_nonblocking(true)?;
 
-        let addr = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port);
+        let addr = SocketAddrV4::new(Self::bind_ipv4_addr(bind_ipv4), port);
         socket.bind(&addr.into())?;
 
         let std_socket: std::net::UdpSocket = socket.into();
@@ -405,7 +421,10 @@ impl Node {
     ///
     /// - If `preferred_port` is non-zero and within range, we try it first.
     /// - Otherwise, we scan the range until we find a free port.
-    fn bind_unicast_in_tcnet_range(preferred_port: u16) -> std::io::Result<(UdpSocket, u16)> {
+    fn bind_unicast_in_tcnet_range(
+        preferred_port: u16,
+        bind_ipv4: Option<Ipv4Addr>,
+    ) -> std::io::Result<(UdpSocket, u16)> {
         let start = PORT_UNICAST_DEFAULT;
         let end = crate::types::PORT_UNICAST_MAX;
 
@@ -421,7 +440,7 @@ impl Node {
 
         let mut last_err: Option<std::io::Error> = None;
         for port in candidates {
-            match Self::create_unicast_socket(port) {
+            match Self::create_unicast_socket(port, bind_ipv4) {
                 Ok(sock) => return Ok((sock, port)),
                 Err(e) => last_err = Some(e),
             }
@@ -468,17 +487,20 @@ impl Node {
             "Binding to control broadcast port {} (with port reuse)",
             PORT_BROADCAST_CONTROL
         );
-        let control_socket: UdpSocket = Self::create_reusable_socket(PORT_BROADCAST_CONTROL)?;
+        let bind_ipv4 = self.config.bind_ipv4;
+        let control_socket: UdpSocket =
+            Self::create_reusable_socket(PORT_BROADCAST_CONTROL, bind_ipv4)?;
 
         info!(
             "Binding to time broadcast port {} (with port reuse)",
             PORT_BROADCAST_TIME
         );
-        let time_socket: UdpSocket = Self::create_reusable_socket(PORT_BROADCAST_TIME)?;
+        let time_socket: UdpSocket =
+            Self::create_reusable_socket(PORT_BROADCAST_TIME, bind_ipv4)?;
 
         // Bind to a free unicast listener port in the spec range (65023-65535)
         let preferred = self.config.listener_port;
-        let (unicast_socket, bound_port) = Self::bind_unicast_in_tcnet_range(preferred)?;
+        let (unicast_socket, bound_port) = Self::bind_unicast_in_tcnet_range(preferred, bind_ipv4)?;
         self.listener_port.store(bound_port, Ordering::Relaxed);
         info!("Bound unicast listener port {}", bound_port);
 
@@ -492,7 +514,7 @@ impl Node {
 
         // Socket for sending Opt-IN broadcasts (ephemeral port, no reuse needed)
         let send_socket: UdpSocket =
-            UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)).await?;
+            UdpSocket::bind(SocketAddrV4::new(Self::bind_ipv4_addr(bind_ipv4), 0)).await?;
         send_socket.set_broadcast(true)?;
         let send_socket = Arc::new(send_socket);
 
